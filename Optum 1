@@ -1,0 +1,227 @@
+# Copyright 2022 The HuggingFace and Meta Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0.
+# See the License at http://www.apache.org/licenses/LICENSE-2.0
+
+import logging
+import os
+import types
+from copy import deepcopy
+from typing import TYPE_CHECKING, Dict, Optional, Union
+
+import torch
+from packaging.version import parse
+
+from ..utils import check_if_pytorch_greater, is_accelerate_available, recurse_getattr, recurse_setattr
+from .models import BetterTransformerManager
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
+
+logger = logging.getLogger(__name__)
+
+if is_accelerate_available():
+    from accelerate import dispatch_model, infer_auto_device_map
+    from accelerate.hooks import remove_hook_from_module
+
+ERROR_MESSAGE = (
+    "BetterTransformer implementation not available for model '{model_name}'. "
+    "Please request its addition via an issue."
+)
+
+def raise_incompatibility_error(*_, **__):
+    """
+    Raises an error if an attempt is made to save or push an incompatible model.
+    """
+    raise ValueError(
+        "Cannot save or push a model converted with `BetterTransformer`. "
+        "Revert the model to its original state by calling `model = BetterTransformer.reverse(model)`."
+    )
+
+
+def replace_model_layers(model, config):
+    """
+    Recursively replaces transformer model layers with BetterTransformer optimized layers.
+
+    Args:
+        model (torch.nn.Module): Original model.
+        config (transformers.PreTrainedConfig): Model configuration.
+
+    Returns:
+        torch.nn.Module: The optimized model.
+    """
+    for name, module in model.named_children():
+        if hasattr(module, "SCB"):
+            raise ValueError(
+                "`load_in_8bit` and `BetterTransformers` are incompatible. "
+                "Pass a model that is not loaded in 8-bit mode."
+            )
+
+        target_classes = BetterTransformerManager.MODEL_MAPPING.get(config.model_type, {}).keys()
+
+        if config.model_type in BetterTransformerManager.OVERWRITE_METHODS:
+            for class_name, (method_name, new_method) in BetterTransformerManager.OVERWRITE_METHODS[config.model_type].items():
+                if module.__class__.__name__ == class_name:
+                    setattr(module, method_name, types.MethodType(new_method, module))
+
+        if any(module.__class__.__name__ == target_class for target_class in target_classes):
+            bettertransformer_module = BetterTransformerManager.MODEL_MAPPING[config.model_type][module.__class__.__name__](
+                module, config
+            )
+            model._modules[name] = bettertransformer_module
+        elif list(module.children()):
+            if config.model_type not in BetterTransformerManager.EXCLUDE_FROM_TRANSFORM or (
+                name not in BetterTransformerManager.EXCLUDE_FROM_TRANSFORM.get(config.model_type, [])
+            ):
+                replace_model_layers(module, config)
+
+    return model
+
+
+def set_last_layer_flag(model: torch.nn.Module):
+    """
+    Flags the last layer as `is_last_layer` in BetterTransformer models.
+
+    Args:
+        model (torch.nn.Module): Model with replaced layers.
+    """
+    def sort_module_names(modules):
+        return [module.__class__.__name__ for module in modules]
+
+    layer_lists = [(len(layers), key) for key, layers in model.named_modules()
+                   if isinstance(layers, torch.nn.ModuleList) and "encoder" in key]
+
+    if layer_lists:
+        _, key = max(layer_lists, key=lambda item: item[0])
+        for module in model._modules[key][-1].modules():
+            if "LayerBetterTransformer" in module.__class__.__name__:
+                module.is_last_layer = True
+                return
+
+    for _, layers in model.named_modules():
+        if isinstance(layers, torch.nn.ModuleList) and all("LayerBetterTransformer" in name for name in sort_module_names(layers)):
+            layers[-1].is_last_layer = True
+            return
+
+    raise Exception(
+        f"Failed to transform model '{model.__class__.__name__}' to BetterTransformer. "
+        "Please file a bug report at https://github.com/huggingface/optimum/issues."
+    )
+
+
+class BetterTransformer:
+    """
+    Wrapper that converts transformers model to BetterTransformer format for faster inference.
+    """
+
+    @check_if_pytorch_greater("1.13.99", "Please upgrade PyTorch for BetterTransformer support.")
+    def transform(
+        model: torch.nn.Module,
+        keep_original_model: bool = False,
+        max_memory: Optional[Dict] = None,
+        offload_dir: Optional[Union[str, os.PathLike]] = None,
+        **kwargs,
+    ) -> torch.nn.Module:
+        """
+        Converts a model to its BetterTransformer format.
+
+        Args:
+            model (torch.nn.Module): The original model.
+            keep_original_model (bool): Whether to retain the original model.
+            max_memory (Optional[Dict]): Maximum memory available per device.
+
+        Returns:
+            torch.nn.Module: The optimized model.
+        """
+        logger.warning(
+            "The BetterTransformer class in optimum.bettertransformers is deprecated. "
+            "It may be removed in a future release."
+        )
+
+        hf_config = model.config
+
+        if hf_config.model_type in ["falcon", "gpt_bigcode", "llama", "whisper"]:
+            raise ValueError(
+                f"Transformers natively support BetterTransformer for model type '{hf_config.model_type}'. "
+                "Please upgrade to transformers>=4.36 and torch>=2.1.1."
+            )
+
+        if hasattr(model, "hf_device_map"):
+            remove_hook_from_module(model, recurse=True)
+
+        if hasattr(model, "use_bettertransformer") and model.use_bettertransformer:
+            raise Exception("Model is already using BetterTransformer.")
+
+        if not BetterTransformerManager.supports(hf_config.model_type):
+            raise NotImplementedError(
+                f"Model type '{hf_config.model_type}' is not yet supported. "
+                "Please request support at https://github.com/huggingface/optimum/issues."
+            )
+
+        if keep_original_model:
+            model_fast = deepcopy(model)
+        else:
+            model_fast = model
+            model = None
+
+        model_fast = replace_model_layers(model_fast, hf_config)
+
+        if BetterTransformerManager.requires_nested_tensor(model_fast.config.model_type):
+            set_last_layer_flag(model_fast)
+
+        setattr(model_fast, "use_bettertransformer", True)
+
+        if hasattr(model_fast, "hf_device_map"):
+            device_map = infer_auto_device_map(model_fast, max_memory=max_memory) if max_memory else model_fast.hf_device_map
+            model_fast = dispatch_model(model_fast, device_map, offload_dir=offload_dir)
+
+        model_fast.save_pretrained = raise_incompatibility_error
+        model_fast.push_to_hub = raise_incompatibility_error
+
+        return model_fast.train() if model.training else model_fast.eval()
+
+    def reverse(bt_model: "PreTrainedModel") -> "PreTrainedModel":
+        """
+        Reverts a BetterTransformer model to its original transformers model.
+
+        Args:
+            bt_model (PreTrainedModel): BetterTransformer model.
+
+        Returns:
+            PreTrainedModel: Original model.
+        """
+        if not getattr(bt_model, "use_bettertransformer", False):
+            raise ValueError("BetterTransformer.reverse() must be called on a transformed model.")
+
+        if parse(torch.__version__) <= parse("1.14"):
+            raise ValueError("Reversion requires torch>=2.0. Please upgrade PyTorch.")
+
+        config = bt_model.config
+        reversed_model = bt_model.__class__(config)
+
+        if not bt_model.training:
+            reversed_model = reversed_model.eval()
+
+        reversed_modules = []
+        for path, module in reversed_model.named_modules():
+            if path.startswith(tuple(reversed_modules)):
+                continue
+
+            if config.model_type in BetterTransformerManager.EXCLUDE_FROM_TRANSFORM and any(
+                sub in path for sub in BetterTransformerManager.EXCLUDE_FROM_TRANSFORM[config.model_type]
+            ):
+                continue
+
+            if any(module.__class__.__name__ == cls for cls in BetterTransformerManager.MODEL_MAPPING[config.model_type]):
+                recurse_setattr(reversed_model, path, recurse_getattr(bt_model, path)._revert(module))
+                reversed_modules.append(path + ".")
+
+        for path, param in reversed_model.state_dict().items():
+            if param.device == torch.device("meta") or not path.startswith(tuple(reversed_modules)):
+                recurse_setattr(reversed_model, path, recurse_getattr(bt_model, path))
+
+        for path, buffer in reversed_model.named_buffers():
+            if buffer.device == torch.device("meta") or not path.startswith(tuple(reversed_modules)):
+                recurse_setattr(reversed_model, path, recurse_getattr(bt_model, path))
+
+        return reversed_model
